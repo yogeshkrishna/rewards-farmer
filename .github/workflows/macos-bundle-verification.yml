@@ -1,0 +1,118 @@
+name: Verify macOS Edge bundle fix
+
+on:
+  push:
+    branches:
+      - codex/macos-bundle-verification
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: macos-15
+    timeout-minutes: 12
+    env:
+      POETRY_KEYRING_ENABLED: "false"
+      POETRY_VIRTUALENVS_IN_PROJECT: "true"
+      PYTHONDONTWRITEBYTECODE: "1"
+      REWARDS_HEADLESS: "false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.10"
+      - name: Verify environment and install the lock
+        run: |
+          sw_vers
+          uname -m
+          test "$(uname -m)" = arm64
+          test "$(git rev-parse HEAD^)" = d025cadeabf44e99abd79fca2412c1b9e6195df0
+          test "$(git rev-parse HEAD^^)" = 146dd2f2322b7d44c6883c4d8495000b29d28497
+          test "$(git diff --name-only HEAD^^ HEAD^)" = src/browser.py
+          python -m pip install --disable-pip-version-check poetry==2.5.1
+          poetry check --lock
+          poetry install --no-interaction --no-ansi
+      - name: Compare the exact startup before and after the patch
+        run: |
+          poetry run python -u - <<'PY'
+          import io
+          import logging
+          import os
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+          from types import ModuleType
+
+          sys.path.insert(0, "src")
+          import accounts
+          import browser
+
+          BASE = "146dd2f2322b7d44c6883c4d8495000b29d28497"
+          baseline = ModuleType("baseline_browser")
+          source = subprocess.check_output(["git", "show", f"{BASE}:src/browser.py"])
+          exec(compile(source, "baseline/browser.py", "exec"), baseline.__dict__)
+
+          bundle = Path("/Applications/Microsoft Edge.app")
+          binary = bundle / "Contents" / "MacOS" / "Microsoft Edge"
+          driver_path = shutil.which("msedgedriver") or str(Path(os.environ["EDGEWEBDRIVER"]) / "msedgedriver")
+          edge_version = subprocess.check_output(
+              ["/usr/libexec/PlistBuddy", "-c", "Print :CFBundleShortVersionString", str(bundle / "Contents" / "Info.plist")],
+              text=True,
+          ).strip()
+          assert sys.platform == "darwin" and not browser.HEADLESS
+          assert binary.is_file() and Path(driver_path).is_file()
+          print(f"STOCK Edge {edge_version}; {subprocess.check_output([driver_path, '--version'], text=True).strip()}")
+
+          def launch(module, name, edge_override, driver_override, expect_failure=False):
+              for key, value in (("EDGE_BINARY", edge_override), ("MSEDGEDRIVER_PATH", driver_override)):
+                  os.environ.pop(key, None)
+                  if value is not None:
+                      os.environ[key] = str(value)
+              with tempfile.TemporaryDirectory(prefix="edge bundle verification ") as profile:
+                  account = accounts.Account(name, profile, "Default")
+                  if name.startswith("patched-bundle"):
+                      assert module.build_options(account).binary_location == str(binary)
+                  diagnostics = io.StringIO()
+                  handler = logging.StreamHandler(diagnostics)
+                  module.logger.addHandler(handler)
+                  try:
+                      driver = module.start_driver(account)
+                  finally:
+                      module.logger.removeHandler(handler)
+                  if driver is None:
+                      message = diagnostics.getvalue().strip()
+                      print(f"DIAGNOSTICS {name}: {message}")
+                      assert expect_failure and "failed to create microsoft edge process" in message.lower(), message
+                      print(f"RESULT {name} REPRODUCED")
+                      return
+                  process = driver.service.process
+                  try:
+                      assert not expect_failure, "The exact baseline configuration unexpectedly launched"
+                      driver.set_page_load_timeout(20)
+                      driver.get("about:blank")
+                      caps = driver.capabilities
+                      driver_version = caps["msedge"]["msedgedriverVersion"].split()[0]
+                      assert driver.current_url == "about:blank" and driver.session_id
+                      assert Path(caps["msedge"]["userDataDir"]).resolve() == Path(profile).resolve()
+                      assert caps["browserVersion"] == edge_version
+                      assert driver_version.split(".")[:3] == edge_version.split(".")[:3]
+                  finally:
+                      driver.quit()
+                  assert process.poll() is not None
+                  print(f"RESULT {name} PASS Edge {edge_version}, EdgeDriver {driver_version}, profile verified, clean shutdown")
+
+          launch(baseline, "baseline-bundle-explicit-driver", bundle, driver_path, expect_failure=True)
+          launch(browser, "patched-bundle-explicit-driver", bundle, driver_path)
+          launch(browser, "patched-bundle-automatic-driver", bundle, None)
+          launch(browser, "patched-full-executable", binary, driver_path)
+          launch(browser, "patched-automatic-discovery", None, None)
+          PY
+      - name: Verify the checkout
+        if: always()
+        run: git diff --exit-code HEAD
