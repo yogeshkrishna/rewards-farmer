@@ -1,0 +1,123 @@
+name: macOS Edge startup
+
+on:
+  push:
+    branches:
+      - codex/macos-edge-startup
+
+permissions:
+  contents: read
+
+jobs:
+  startup:
+    runs-on: macos-15
+    timeout-minutes: 15
+    env:
+      POETRY_KEYRING_ENABLED: "false"
+      POETRY_VIRTUALENVS_IN_PROJECT: "true"
+      PYTHONDONTWRITEBYTECODE: "1"
+      REWARDS_HEADLESS: "false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: User0332/rewards-farmer
+          ref: 146dd2f2322b7d44c6883c4d8495000b29d28497
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.10"
+      - name: Record environment and install the lock
+        run: |
+          sw_vers
+          uname -m
+          test "$(uname -m)" = arm64
+          test "$(git rev-parse HEAD)" = 146dd2f2322b7d44c6883c4d8495000b29d28497
+          python --version
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' '/Applications/Microsoft Edge.app/Contents/Info.plist'
+          if command -v msedgedriver >/dev/null 2>&1; then
+            msedgedriver --version
+          else
+            "$EDGEWEBDRIVER/msedgedriver" --version
+          fi
+          python -m pip install --disable-pip-version-check poetry==2.5.1
+          poetry check --lock
+          poetry install --no-interaction --no-ansi
+      - name: Check the shared Edge launcher
+        run: |
+          poetry run python -u - <<'PY'
+          import logging
+          import os
+          import shutil
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          sys.path.insert(0, "src")
+
+          import accounts
+          import browser
+
+          logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+          if sys.platform != "darwin" or browser.HEADLESS:
+              raise SystemExit("Expected headed macOS")
+          bundle = Path("/Applications/Microsoft Edge.app")
+          binary = bundle / "Contents/MacOS/Microsoft Edge"
+          driver_path = shutil.which("msedgedriver") or str(Path(os.environ["EDGEWEBDRIVER"]) / "msedgedriver")
+          if not binary.is_file() or not Path(driver_path).is_file():
+              raise SystemExit("Stock Edge and matching EdgeDriver are required")
+
+          cases = (
+              ("automatic", None, None, True),
+              ("executable", binary, None, True),
+              ("bundle", bundle, None, False),
+              ("executable-with-driver", binary, driver_path, True),
+              ("bundle-with-driver", bundle, driver_path, False),
+          )
+
+          def launch_case(name, edge_path, driver_path_override):
+              for key, value in (("EDGE_BINARY", edge_path), ("MSEDGEDRIVER_PATH", driver_path_override)):
+                  os.environ.pop(key, None)
+                  if value is not None:
+                      os.environ[key] = str(value)
+
+              with tempfile.TemporaryDirectory(prefix="rewards edge ") as profile:
+                  print(f"CASE {name} started", flush=True)
+                  driver = browser.start_driver(accounts.Account(name, profile, "Default"))
+                  if driver is None:
+                      return "START_REJECTED"
+                  process = driver.service.process
+                  try:
+                      driver.set_page_load_timeout(20)
+                      driver.get("about:blank")
+                      if not driver.session_id or driver.current_url != "about:blank":
+                          raise RuntimeError("Session failed to load a blank page")
+                      capabilities = driver.capabilities
+                      edge = capabilities.get("msedge", {})
+                      reported_profile = edge.get("userDataDir")
+                      if reported_profile and Path(reported_profile).resolve() != Path(profile).resolve():
+                          raise RuntimeError("Edge reported a different browser profile")
+                      print(f"SESSION {name}: Edge {capabilities.get('browserVersion')}, driver {edge.get('msedgedriverVersion')}, profile verified={bool(reported_profile)}")
+                  finally:
+                      driver.quit()
+                  if process.poll() is None:
+                      raise RuntimeError("Driver process still running after quit")
+                  return "STARTED_AND_QUIT"
+
+          unexpected = []
+          for name, edge_path, driver_path_override, required in cases:
+              try:
+                  result = launch_case(name, edge_path, driver_path_override)
+                  if required and result != "STARTED_AND_QUIT":
+                      unexpected.append(name)
+              except Exception as exc:
+                  result = "PROBE_ERROR"
+                  print(f"ERROR {name}: {type(exc).__name__}: {str(exc).splitlines()[0]}")
+                  unexpected.append(name)
+              print(f"RESULT {name} {result}", flush=True)
+
+          if unexpected:
+              raise SystemExit("Unexpected startup or shutdown outcome: " + ", ".join(unexpected))
+          PY
+      - name: Verify the checkout
+        if: always()
+        run: git diff --exit-code HEAD
