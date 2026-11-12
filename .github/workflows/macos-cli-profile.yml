@@ -1,0 +1,191 @@
+name: macOS CLI profile
+
+on:
+  push:
+    branches:
+      - codex/macos-cli-profile
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    runs-on: macos-15
+    timeout-minutes: 12
+    env:
+      POETRY_KEYRING_ENABLED: "false"
+      POETRY_VIRTUALENVS_IN_PROJECT: "true"
+      PYTHONDONTWRITEBYTECODE: "1"
+      REWARDS_HEADLESS: "false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: User0332/rewards-farmer
+          ref: 146dd2f2322b7d44c6883c4d8495000b29d28497
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.10"
+      - name: Verify environment and install locked dependencies
+        run: |
+          sw_vers
+          uname -m
+          test "$(uname -m)" = arm64
+          test "$(git rev-parse HEAD)" = 146dd2f2322b7d44c6883c4d8495000b29d28497
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' '/Applications/Microsoft Edge.app/Contents/Info.plist'
+          if command -v msedgedriver >/dev/null 2>&1; then
+            msedgedriver --version
+          else
+            "$EDGEWEBDRIVER/msedgedriver" --version
+          fi
+          python -m pip install --disable-pip-version-check poetry==2.5.1
+          poetry check --lock
+          poetry install --no-interaction --no-ansi
+      - name: Verify profile reuse and check-only records on loopback
+        run: |
+          poetry run python -u - <<'PY'
+          import fcntl
+          import json
+          import os
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          import threading
+          from http.cookies import SimpleCookie
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          from pathlib import Path
+
+          PAGE = """<!doctype html><html lang="en"><meta charset="utf-8">
+          <title>Local profile check</title>
+          <header><button aria-label="View profile">BALANCE</button></header>
+          <button onclick="document.getElementById('react-aria-points').hidden = false">Points breakdown</button>
+          <button onclick="document.getElementById('react-aria-daily').hidden = false">Daily set streak</button>
+          <section id="react-aria-points" hidden>
+            <button aria-label="Close points breakdown" onclick="this.parentElement.hidden = true">Close</button>
+            <div>Bing search</div><div>3 / 15</div><div>Today's points</div><div>3</div>
+          </section>
+          <section id="react-aria-daily" hidden>
+            <button aria-label="Close daily set" onclick="this.parentElement.hidden = true">Close</button>
+            <div>Activity: 3 / 3</div><div>Completed</div><div>Completed</div><div>Completed</div>
+          </section>
+          <section id="moreactivities"><a href="#local">Local activity</a></section>
+          </html>
+          """
+
+          requests_seen = []
+
+          class Fixture(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path not in ("/seed", "/observe"):
+                      self.send_error(404)
+                      return
+                  marker = SimpleCookie(self.headers.get("Cookie", "")).get("profile_probe")
+                  has_marker = marker is not None and marker.value == "present"
+                  requests_seen.append((self.path, has_marker))
+                  balance = 17 if self.path == "/seed" else (37 if has_marker else 0)
+                  body = PAGE.replace("BALANCE", str(balance)).encode()
+                  self.send_response(200)
+                  self.send_header("Content-Type", "text/html; charset=utf-8")
+                  self.send_header("Cache-Control", "no-store")
+                  if self.path == "/seed":
+                      self.send_header("Set-Cookie", "profile_probe=present; Max-Age=1800; Path=/; HttpOnly; SameSite=Lax")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def log_message(self, *_args):
+                  pass
+
+          CHILD = """
+          import os
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, "src")
+
+          import constants
+          import main
+          import rewards_state
+          import run_lock
+
+          if sys.platform != "darwin" or main.HEADLESS:
+              raise SystemExit("Expected headed macOS")
+
+          constants.RUNS_DIR = os.environ["PROBE_RUNS_DIR"]
+          rewards_state.EARN_URL = os.environ["PROBE_FIXTURE_URL"]
+          expected_profile = Path(os.environ["USER_DATA_DIR"], os.environ["REWARDS_ACCOUNTS"]).resolve()
+
+          def require_local_page(driver, elements, _timeout):
+              lock = run_lock.status()
+              assert lock and lock.pid == os.getpid() and lock.owner == "farmer", lock
+              capabilities = driver.capabilities
+              assert Path(capabilities["msedge"]["userDataDir"]).resolve() == expected_profile
+              driver.get(rewards_state.EARN_URL)
+              assert driver.current_url == rewards_state.EARN_URL
+              elements.get_points_breakdown_button()
+
+          def reject_tasks(*_args, **_kwargs):
+              raise AssertionError("check-only reached task dispatch")
+
+          rewards_state._require_earn_page = require_local_page
+          main.rewards_tasks.RewardsTaskUtils = reject_tasks
+          raise SystemExit(main.cli(["--check-only", "--unattended"]))
+          """
+
+          def verify_record(path, profiles, balance):
+              events = [json.loads(line) for line in path.read_text().splitlines()]
+              assert [e["type"] for e in events] == ["run_start", "account_start", "state", "account_end", "run_end"], events
+              start, account, state, account_end, end = events
+              assert start["plan"]["check_only"] and start["accounts"] == ["macos-probe"], start
+              assert account["account"] == "macos-probe" and Path(account["profile"]).resolve() == (profiles / "macos-probe").resolve(), account
+              assert state["phase"] == "before" and state["balance"] == balance and state["unreadable"] is None, state
+              assert (state["searches_earned"], state["searches_max"], state["daily_set_open"]) == (3, 15, 0), state
+              assert account_end["started"] and not account_end["ran_tasks"] and account_end["error_code"] is None, account_end
+              assert (end["result"], end["exit_code"], end["accounts_started"], end["accounts_ran"]) == ("checked", 0, 1, 0), end
+              assert not (profiles / ".rewards-farmer.lock.json").exists()
+              with (profiles / ".rewards-farmer.lock").open("r+b") as descriptor:
+                  fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+              print(f"RECORD {path.stem}: before balance={balance}, unreadable=None, result=checked, tasks=0, lock released")
+
+          if sys.platform != "darwin":
+              raise SystemExit("Expected macOS")
+
+          with ThreadingHTTPServer(("127.0.0.1", 0), Fixture) as server, tempfile.TemporaryDirectory(prefix="rewards CLI ") as folder:
+              server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+              server_thread.start()
+              try:
+                  profiles = Path(folder) / "profiles"
+                  runs = Path(folder) / "runs"
+                  env = {
+                      **os.environ,
+                      "EDGE_BINARY": "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                      "MSEDGEDRIVER_PATH": shutil.which("msedgedriver") or str(Path(os.environ["EDGEWEBDRIVER"]) / "msedgedriver"),
+                      "USER_DATA_DIR": str(profiles),
+                      "REWARDS_ACCOUNTS": "macos-probe",
+                      "PROBE_RUNS_DIR": str(runs),
+                  }
+                  for route, balance in (("/seed", 17), ("/observe", 37)):
+                      previous = set(runs.glob("*.jsonl"))
+                      start_index = len(requests_seen)
+                      env["PROBE_FIXTURE_URL"] = f"http://127.0.0.1:{server.server_port}{route}"
+                      print(f"LAUNCH {route} through --check-only")
+                      subprocess.run([sys.executable, "-u", "-c", CHILD], env=env, check=True, timeout=100)
+                      records = set(runs.glob("*.jsonl")) - previous
+                      assert len(records) == 1, records
+                      verify_record(records.pop(), profiles, balance)
+                      observed = requests_seen[start_index:]
+                      assert observed and all(path == route for path, _ in observed), observed
+                      if route == "/seed":
+                          assert observed[0] == ("/seed", False), observed
+                          print("PROFILE initial request had no marker; loopback server seeded a persistent cookie")
+                      else:
+                          assert all(has_marker for _, has_marker in observed), observed
+                          print("PROFILE second process sent the persisted cookie on the observe-only route")
+              finally:
+                  server.shutdown()
+                  server_thread.join(timeout=5)
+          PY
+      - name: Verify the checkout
+        if: always()
+        run: git diff --exit-code HEAD
