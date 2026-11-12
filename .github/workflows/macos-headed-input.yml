@@ -1,0 +1,190 @@
+name: macOS headed input
+
+on:
+  push:
+    branches:
+      - codex/macos-headed-input
+
+permissions:
+  contents: read
+
+jobs:
+  input:
+    runs-on: macos-15
+    timeout-minutes: 12
+    env:
+      POETRY_KEYRING_ENABLED: "false"
+      POETRY_VIRTUALENVS_IN_PROJECT: "true"
+      PYTHONDONTWRITEBYTECODE: "1"
+      REWARDS_HEADLESS: "false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: User0332/rewards-farmer
+          ref: 146dd2f2322b7d44c6883c4d8495000b29d28497
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.10"
+      - name: Verify environment and install locked dependencies
+        run: |
+          sw_vers
+          uname -m
+          test "$(uname -m)" = arm64
+          test "$(git rev-parse HEAD)" = 146dd2f2322b7d44c6883c4d8495000b29d28497
+          python -m pip install --disable-pip-version-check poetry==2.5.1
+          poetry check --lock
+          poetry install --no-interaction --no-ansi
+      - name: Observe headed input on a local page
+        run: |
+          poetry run python -u - <<'PY'
+          import base64
+          import json
+          import os
+          import shutil
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          sys.path.insert(0, "src")
+
+          import accounts
+          import browser
+          from mimic_typing import KeyboardUtils
+          from mouse_trajectory import MouseUtils
+          from selenium.webdriver.common.action_chains import ActionChains
+          from selenium.webdriver.common.by import By
+          from selenium.webdriver.common.keys import Keys
+          from selenium.webdriver.support.ui import WebDriverWait
+
+          PAGE = """
+          <!doctype html><html lang="en"><meta charset="utf-8"><title>Local input check</title>
+          <style>
+          body { margin: 32px; scroll-behavior: auto; }
+          button, input { display: block; width: 220px; height: 42px; margin-bottom: 12px; }
+          </style>
+          <button id="target">Target</button><input id="field" aria-label="Test text">
+          <div style="height: 130vh"></div><button id="below">Below the fold</button>
+          <div style="height: 110vh"></div>
+          <script>
+          window.probe = { moves: 0, clicks: 0, wheels: 0, inputs: 0, keys: [] };
+          target.addEventListener("pointermove", () => probe.moves++);
+          target.addEventListener("click", () => probe.clicks++);
+          window.addEventListener("wheel", () => probe.wheels++, { passive: true });
+          field.addEventListener("input", () => probe.inputs++);
+          field.addEventListener("keydown", event => probe.keys.push(event.key));
+          </script></html>
+          """
+          PAYLOAD = "Mac input 47"
+
+          def snapshot(driver):
+              return driver.execute_script("""
+                  const rect = document.getElementById('below').getBoundingClientRect();
+                  return {...window.probe, scrollY: window.scrollY,
+                          belowVisible: rect.top >= 0 && rect.bottom <= window.innerHeight,
+                          focused: document.activeElement.id,
+                          text: document.getElementById('field').value};
+              """)
+
+          def observe(driver, condition):
+              return WebDriverWait(driver, 5).until(lambda _: condition(state := snapshot(driver)) and state)
+
+          def pointer(driver, project):
+              target = driver.find_element(By.ID, "target")
+              if project:
+                  MouseUtils(driver).move_to_element(target)
+              else:
+                  anchor = driver.find_element(By.ID, "field")
+                  ActionChains(driver).move_to_element(anchor).move_to_element(target).perform()
+              return observe(driver, lambda state: state["moves"] > 0)
+
+          def click(driver, project):
+              target = driver.find_element(By.ID, "target")
+              if project:
+                  mouse = MouseUtils(driver)
+                  mouse.move_to_element(target)
+                  mouse.human_like_click()
+              else:
+                  target.click()
+              return observe(driver, lambda state: state["clicks"] == 1)
+
+          def scroll(driver, project):
+              target = driver.find_element(By.ID, "below")
+              before = snapshot(driver)
+              assert before["scrollY"] == 0 and not before["belowVisible"], before
+              if project:
+                  mouse = MouseUtils(driver)
+                  mouse.wheel_scroll_element_into_view(target)
+              else:
+                  distance = driver.execute_script(
+                      "return Math.round(arguments[0].getBoundingClientRect().top - innerHeight / 2)", target
+                  )
+                  ActionChains(driver).scroll_by_amount(0, distance).perform()
+              down = observe(driver, lambda state: state["wheels"] > 0 and state["scrollY"] > 0 and state["belowVisible"])
+              if project:
+                  mouse.wheel_scroll_to_top()
+              else:
+                  ActionChains(driver).scroll_by_amount(0, -int(down["scrollY"]) - 100).perform()
+              top = observe(driver, lambda state: state["scrollY"] == 0 and state["wheels"] > down["wheels"])
+              return {"down": down["scrollY"], "wheelEventsDown": down["wheels"],
+                      "targetVisible": down["belowVisible"], "backAtTop": top["scrollY"] == 0,
+                      "wheelEventsTotal": top["wheels"]}
+
+          def typing(driver, project):
+              field = driver.find_element(By.ID, "field")
+              field.click()
+              observe(driver, lambda state: state["focused"] == "field")
+              if project:
+                  KeyboardUtils(driver).send_keys(PAYLOAD + Keys.ENTER)
+              else:
+                  field.send_keys(PAYLOAD, Keys.ENTER)
+              return observe(driver, lambda state: state["focused"] == "field" and
+                             state["text"] == PAYLOAD and state["inputs"] > 0 and "Enter" in state["keys"])
+
+          def check(driver, name, action, project):
+              method = "project" if project else "selenium"
+              document = PAGE.replace("<title>", f'<meta name="case" content="{name}-{method}"><title>', 1)
+              url = "data:text/html;base64," + base64.b64encode(document.encode()).decode()
+              print(f"CASE {name} {method} started")
+              driver.get(url)
+              try:
+                  print(f"RESULT {name} {method} PASS {json.dumps(action(driver, project))}")
+                  return True
+              except Exception as exc:
+                  detail = str(exc).splitlines()
+                  print(f"RESULT {name} {method} FAIL {type(exc).__name__}: {detail[0] if detail else ''}")
+                  print(f"STATE {name} {method} {json.dumps(snapshot(driver))}")
+                  return False
+
+          if sys.platform != "darwin" or browser.HEADLESS:
+              raise SystemExit("Expected headed macOS")
+
+          os.environ["EDGE_BINARY"] = "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
+          os.environ["MSEDGEDRIVER_PATH"] = shutil.which("msedgedriver") or str(Path(os.environ["EDGEWEBDRIVER"]) / "msedgedriver")
+          failures = []
+          with tempfile.TemporaryDirectory(prefix="rewards edge input ") as profile:
+              driver = browser.start_driver(accounts.Account("headed-input", profile, "Default"))
+              if driver is None:
+                  raise SystemExit("Unable to establish the known-good Edge session")
+              process = driver.service.process
+              try:
+                  driver.set_page_load_timeout(20)
+                  driver.set_script_timeout(20)
+                  caps = driver.capabilities
+                  print(f"SESSION Edge {caps['browserVersion']}, driver {caps['msedge']['msedgedriverVersion']}")
+                  for action in (pointer, click, scroll, typing):
+                      if not check(driver, action.__name__, action, project=True):
+                          failures.append(action.__name__)
+                          check(driver, action.__name__, action, project=False)
+              finally:
+                  driver.quit()
+              if process.poll() is None:
+                  raise SystemExit("Driver process still running after quit")
+              print("SESSION quit; EdgeDriver exited")
+
+          if failures:
+              raise SystemExit("Project input failed: " + ", ".join(failures))
+          PY
+      - name: Verify the checkout
+        if: always()
+        run: git diff --exit-code HEAD
